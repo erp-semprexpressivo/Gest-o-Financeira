@@ -57,7 +57,6 @@ def init_db():
     ]
     for q in queries: run_query(q)
     
-    # Limpa as senhas antigas e vulneráveis para forçar a segurança máxima
     run_query("DELETE FROM usuarios")
     
     acessos = [("Leonidas Castilho", "123456", "Admin"), ("Gracielle Malvestio", "123456", "Admin"), 
@@ -126,6 +125,7 @@ def formatar_moeda(valor):
     return f"{v:,.2f} €".replace(',', 'X').replace('.', ',').replace('X', '.')
 
 def extrair_valor_ia(texto):
+    if not texto: return 0.0
     numeros = re.findall(r'\d+[.,\d]*', str(texto))
     if numeros:
         n = numeros[-1].replace(',', '.')
@@ -133,10 +133,6 @@ def extrair_valor_ia(texto):
         try: return float(n)
         except: return 0.0
     return 0.0
-
-def limpar_texto_ia(texto):
-    if ":" in texto: texto = texto.split(":", 1)[1]
-    return re.sub(r'^\d+[\.\)]\s+', '', texto.strip()).strip()
 
 def limpar_memoria():
     st.cache_data.clear()
@@ -256,7 +252,7 @@ elif st.session_state.menu == "Dashboard":
     else: st.info("Sem despesas registadas.")
 
 # ===============================================
-# REGISTAR DESPESA (IA + MANUAL)
+# REGISTAR DESPESA (IA MILITAR)
 # ===============================================
 elif st.session_state.menu == "Faturas":
     st.title("📥 Registar Despesa (Cloud)")
@@ -267,22 +263,30 @@ elif st.session_state.menu == "Faturas":
     with t_ia:
         up = st.file_uploader("Arraste a Fatura da Despesa", type=['png', 'jpg', 'pdf'])
         if up:
-            with st.spinner("🤖 IA a ler o documento... aguarde uns segundos..."):
+            with st.spinner("🤖 IA a ler o documento... aguarde..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{up.name.split('.')[-1]}") as tmp:
                     tmp.write(up.getvalue()); t_path = tmp.name
+                
                 modelo = genai.GenerativeModel('gemini-2.5-flash')
-                res = modelo.generate_content([genai.upload_file(t_path), f"Extraia em 6 linhas: 1.Fornecedor, 2.Data YYYY-MM-DD, 3.Total, 4.IVA, 5.Categoria ({pasts}), 6.Nº Fatura."])
-                dados = res.text.strip().split('\n')
+                # ORDEM MILITAR PARA A IA
+                prompt_desp = f"Aja como um robô extrator de dados. Analise a fatura e responda APENAS com 6 valores separados pelo símbolo |. Sem texto adicional. Formato: Fornecedor | Data(YYYY-MM-DD) | Valor Total | Valor IVA | Categoria | Nº Fatura. Categorias válidas: {pasts}. Exemplo de resposta perfeita: Galp | 2024-05-10 | 50.00 | 11.50 | Combustível | FT123"
+                res = modelo.generate_content([genai.upload_file(t_path), prompt_desp])
+                
+                # Corta a resposta pelas barras |
+                dados = res.text.replace('**', '').strip().split('|')
+                
+                # Garantir que a lista tem 6 espaços mesmo se a IA falhar
+                while len(dados) < 6: dados.append("")
                 
                 with st.form("f_ia"):
                     c1, c2, c3 = st.columns(3)
-                    f_forn = c1.text_input("Fornecedor", limpar_texto_ia(dados[0]) if len(dados)>0 else "")
-                    f_dat = c2.text_input("Data", limpar_texto_ia(dados[1]) if len(dados)>1 else "")
-                    f_num = c3.text_input("Nº Fatura", limpar_texto_ia(dados[5]) if len(dados)>5 else "S/N")
+                    f_forn = c1.text_input("Fornecedor", dados[0].strip())
+                    f_dat = c2.text_input("Data", dados[1].strip())
+                    f_num = c3.text_input("Nº Fatura", dados[5].strip())
                     
                     c4, c5, c6, c7 = st.columns(4)
-                    f_val = c4.number_input("Valor Total (€)", value=extrair_valor_ia(dados[2]) if len(dados)>2 else 0.0)
-                    f_iva = c5.number_input("IVA (€)", value=extrair_valor_ia(dados[3]) if len(dados)>3 else 0.0)
+                    f_val = c4.number_input("Valor Total (€)", value=extrair_valor_ia(dados[2]))
+                    f_iva = c5.number_input("IVA (€)", value=extrair_valor_ia(dados[3]))
                     f_stat = c6.selectbox("Status", ["Pendente", "Pago"])
                     f_cc = c7.selectbox("Centro Custo", ["Sede"] + clis)
                     
@@ -306,7 +310,7 @@ elif st.session_state.menu == "Faturas":
                 st.rerun()
 
 # ===============================================
-# REGISTAR RECEITA (Erro Corrigido Aqui!)
+# REGISTAR RECEITA (IA MILITAR)
 # ===============================================
 elif st.session_state.menu == "Receitas":
     st.title("💰 Registar Faturação (Receitas)")
@@ -319,22 +323,30 @@ elif st.session_state.menu == "Receitas":
             with st.spinner("🤖 IA a processar documento... aguarde..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{up_r.name.split('.')[-1]}") as tmp:
                     tmp.write(up_r.getvalue()); t_path = tmp.name
+                
                 modelo = genai.GenerativeModel('gemini-2.5-flash')
-                res = modelo.generate_content([genai.upload_file(t_path), "Extraia 4 linhas: 1.Cliente, 2.Data YYYY-MM-DD, 3.Valor Total, 4.Valor IVA."])
-                dados = res.text.strip().split('\n')
+                # ORDEM MILITAR PARA A IA
+                prompt_rec = "Aja como um robô extrator de dados. Analise a fatura e responda APENAS com 4 valores separados pelo símbolo |. Sem texto adicional. Formato: Cliente | Data(YYYY-MM-DD) | Valor Total | Valor IVA. Exemplo perfeito: Empresa XYZ | 2024-05-10 | 1500.00 | 345.00"
+                res = modelo.generate_content([genai.upload_file(t_path), prompt_rec])
+                
+                # Corta a resposta pelas barras |
+                dados = res.text.replace('**', '').strip().split('|')
+                
+                # Garantir que a lista tem 4 espaços mesmo se a IA falhar
+                while len(dados) < 4: dados.append("")
                 
                 with st.form("f_ia_rec"):
                     c1, c2 = st.columns(2)
-                    c_ia = c1.text_input("Cliente (Lido pela IA)", limpar_texto_ia(dados[0]) if len(dados)>0 else "")
+                    c_ia = c1.text_input("Cliente (Lido pela IA)", dados[0].strip())
                     stat_ia = c2.selectbox("Status", ["Pendente", "Pago"])
                     
                     c3, c4, c5 = st.columns(3)
-                    d_ia = c3.text_input("Data", limpar_texto_ia(dados[1]) if len(dados)>1 else "")
-                    iv_ia = c4.number_input("IVA (€)", value=extrair_valor_ia(dados[3]) if len(dados)>3 else 0.0)
-                    v_ia = c5.number_input("Total a Receber (€)", value=extrair_valor_ia(dados[2]) if len(dados)>2 else 0.0)
+                    d_ia = c3.text_input("Data", dados[1].strip())
+                    iv_ia = c4.number_input("IVA (€)", value=extrair_valor_ia(dados[3]))
+                    v_ia = c5.number_input("Total a Receber (€)", value=extrair_valor_ia(dados[2]))
                     
                     if st.form_submit_button("Guardar Receita na Nuvem", use_container_width=True):
-                        run_query("INSERT INTO clientes (nome) VALUES (%s) ON CONFLICT (nome) DO NOTHING", (c_ia,))
+                        if c_ia: run_query("INSERT INTO clientes (nome) VALUES (%s) ON CONFLICT (nome) DO NOTHING", (c_ia,))
                         run_query("INSERT INTO receitas (data, cliente, valor, iva, categoria, status, criado_por) VALUES (%s,%s,%s,%s,%s,%s,%s)", 
                                   (d_ia, c_ia, v_ia, iv_ia, "Serviço Prestado", stat_ia, st.session_state.usuario_nome))
                         st.success("Receita Guardada!")
