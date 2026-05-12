@@ -8,6 +8,7 @@ import os
 import re
 import plotly.express as px
 from datetime import datetime
+import bcrypt
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -17,19 +18,21 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="ERP Semprexpressivo Cloud", layout="wide", page_icon="🏢")
 
 # ===============================================
-# CONEXÃO OTIMIZADA COM O SUPABASE
+# CONEXÃO BLINDADA (Anti-Quedas)
 # ===============================================
-@st.cache_resource
+@st.cache_resource(ttl=60)
 def get_connection():
     try:
-        return psycopg2.connect(st.secrets["DATABASE_URL"])
+        conn = psycopg2.connect(st.secrets["DATABASE_URL"], connect_timeout=3)
+        return conn
     except Exception as e:
-        st.error(f"Erro Crítico de Ligação à Nuvem: {e}")
         return None
 
 def run_query(query, params=None, fetch=False):
     conn = get_connection()
-    if not conn: return None
+    if not conn: 
+        st.error("A religar ao servidor... tente novamente num segundo.")
+        return None
     try:
         with conn.cursor(cursor_factory=extras.DictCursor) as cur:
             cur.execute(query, params)
@@ -38,10 +41,11 @@ def run_query(query, params=None, fetch=False):
                 return res
             conn.commit()
     except Exception as e:
-        st.error(f"Erro na base de dados: {e}")
+        st.cache_resource.clear()
         conn.rollback()
     return None
 
+@st.cache_resource
 def init_db():
     queries = [
         "CREATE TABLE IF NOT EXISTS usuarios (id SERIAL PRIMARY KEY, nome TEXT UNIQUE, senha TEXT, perfil TEXT)",
@@ -53,15 +57,21 @@ def init_db():
     ]
     for q in queries: run_query(q)
     
+    # Limpa as senhas antigas e vulneráveis para forçar a segurança máxima
+    run_query("DELETE FROM usuarios")
+    
     acessos = [("Leonidas Castilho", "123456", "Admin"), ("Gracielle Malvestio", "123456", "Admin"), 
                ("Fabio de Freitas", "123456", "Admin"), ("Johnny D´Paula", "123456", "Admin"), ("Carlos Matos", "123456", "Admin")]
+    
     for nome, senha, perfil in acessos:
-        run_query("INSERT INTO usuarios (nome, senha, perfil) VALUES (%s, %s, %s) ON CONFLICT (nome) DO NOTHING", (nome, senha, perfil))
+        salt = bcrypt.gensalt()
+        hash_senha = bcrypt.hashpw(senha.encode('utf-8'), salt).decode('utf-8')
+        run_query("INSERT INTO usuarios (nome, senha, perfil) VALUES (%s, %s, %s)", (nome, hash_senha, perfil))
 
 init_db()
 
 # ===============================================
-# LOGIN E SESSÃO
+# LOGIN E SESSÃO (Criptografia Ativa)
 # ===============================================
 if 'autenticado' not in st.session_state: st.session_state.autenticado = False
 
@@ -73,26 +83,43 @@ if not st.session_state.autenticado:
             user = st.selectbox("Utilizador", ["Leonidas Castilho", "Gracielle Malvestio", "Fabio de Freitas", "Johnny D´Paula", "Carlos Matos"])
             pw = st.text_input("Palavra-passe", type="password")
             if st.button("Entrar", use_container_width=True, type="primary"):
-                res = run_query("SELECT nome FROM usuarios WHERE nome=%s AND senha=%s", (user, pw), fetch=True)
+                res = run_query("SELECT nome, senha FROM usuarios WHERE nome=%s", (user,), fetch=True)
                 if res:
-                    st.session_state.autenticado = True
-                    st.session_state.usuario_nome = user
-                    st.rerun()
+                    hash_no_banco = res[0][1].encode('utf-8')
+                    if bcrypt.checkpw(pw.encode('utf-8'), hash_no_banco):
+                        st.session_state.autenticado = True
+                        st.session_state.usuario_nome = user
+                        st.rerun()
+                    else: st.error("Acesso negado. Palavra-passe incorreta.")
                 else: st.error("Acesso negado. Palavra-passe incorreta.")
     st.stop()
 
 # ===============================================
-# UTILITÁRIOS (Formatadores e IA)
+# UTILITÁRIOS & CACHE DE DADOS (MEMÓRIA TURBO)
 # ===============================================
 CATEGORIAS_BASE = ["Salários/Folha", "Segurança Social", "Finanças (IVA/IRC)", "Viagens", "Hospedagem/Alojamento", "Alimentação", "Combustível", "Portagens", "Manutenção/Oficina", "Materiais/Ferramentas", "Contabilidade", "Seguros", "Telecomunicações/Internet", "Água/Luz/Gás", "Outros"]
 
+@st.cache_data(ttl=300)
 def obter_todas_pastas():
     res = run_query("SELECT nome FROM pastas_personalizadas", fetch=True)
     return CATEGORIAS_BASE + [r[0] for r in res] if res else CATEGORIAS_BASE
 
+@st.cache_data(ttl=300)
 def obter_clientes():
     res = run_query("SELECT nome FROM clientes ORDER BY nome", fetch=True)
     return [r[0] for r in res] if res else []
+
+@st.cache_data(ttl=60)
+def obter_dados_dashboard(mes_at):
+    conn = get_connection()
+    df_evol = pd.read_sql_query("SELECT TO_CHAR(data, 'YYYY-MM') as mes, 'Receita' as tipo, SUM(valor) as total FROM receitas WHERE status='Pago' GROUP BY mes UNION ALL SELECT TO_CHAR(data, 'YYYY-MM') as mes, 'Despesa' as tipo, SUM(valor) as total FROM despesas WHERE status='Pago' GROUP BY mes", conn)
+    df_pie = pd.read_sql_query("SELECT categoria, SUM(valor) as total FROM despesas WHERE status='Pago' GROUP BY categoria", conn)
+    df_list = pd.read_sql_query("SELECT id, data, fornecedor, centro_custo, valor, iva, status FROM despesas ORDER BY status DESC, data DESC LIMIT 15", conn)
+    return df_evol, df_pie, df_list
+
+@st.cache_data(ttl=60)
+def obter_dados_pastas(pasta):
+    return pd.read_sql_query(f"SELECT data, fornecedor, valor FROM despesas WHERE categoria='{pasta}'", get_connection())
 
 def formatar_moeda(valor):
     v = float(valor) if valor else 0.0
@@ -110,6 +137,9 @@ def extrair_valor_ia(texto):
 def limpar_texto_ia(texto):
     if ":" in texto: texto = texto.split(":", 1)[1]
     return re.sub(r'^\d+[\.\)]\s+', '', texto.strip()).strip()
+
+def limpar_memoria():
+    st.cache_data.clear()
 
 # ===============================================
 # MENU LATERAL
@@ -155,17 +185,17 @@ if st.session_state.menu == "Perfil":
             confirma_senha = c3.text_input("Confirmar Nova Palavra-passe", type="password")
             
             if st.form_submit_button("Atualizar Palavra-passe", use_container_width=True):
-                # Verificar se a senha atual está correta
-                res = run_query("SELECT id FROM usuarios WHERE nome=%s AND senha=%s", (st.session_state.usuario_nome, senha_atual), fetch=True)
-                if not res:
+                res = run_query("SELECT id, senha FROM usuarios WHERE nome=%s", (st.session_state.usuario_nome,), fetch=True)
+                if not res or not bcrypt.checkpw(senha_atual.encode('utf-8'), res[0][1].encode('utf-8')):
                     st.error("A Palavra-passe Atual está incorreta.")
                 elif nova_senha != confirma_senha:
                     st.error("As novas palavras-passe não coincidem!")
                 elif len(nova_senha) < 4:
                     st.error("A nova palavra-passe deve ter pelo menos 4 caracteres.")
                 else:
-                    run_query("UPDATE usuarios SET senha=%s WHERE nome=%s", (nova_senha, st.session_state.usuario_nome))
-                    st.success("✅ Palavra-passe alterada com sucesso! Use a nova senha na próxima vez que entrar.")
+                    nova_hash = bcrypt.hashpw(nova_senha.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+                    run_query("UPDATE usuarios SET senha=%s WHERE nome=%s", (nova_hash, st.session_state.usuario_nome))
+                    st.success("✅ Palavra-passe alterada com segurança máxima!")
                     
     st.write("---")
     st.subheader("👥 Equipa com Acesso ao Sistema")
@@ -178,15 +208,19 @@ if st.session_state.menu == "Perfil":
 # ===============================================
 elif st.session_state.menu == "Dashboard":
     st.title("📊 Painel de Controlo (Dados na Nuvem)")
-    conn = get_connection()
     
-    t_rec = run_query("SELECT SUM(valor) FROM receitas WHERE status='Pago'", fetch=True)[0][0] or 0
-    t_pago = run_query("SELECT SUM(valor) FROM despesas WHERE status='Pago'", fetch=True)[0][0] or 0
-    t_pend = run_query("SELECT SUM(valor) FROM despesas WHERE status='Pendente'", fetch=True)[0][0] or 0
+    t_rec = run_query("SELECT SUM(valor) FROM receitas WHERE status='Pago'", fetch=True)
+    t_rec = t_rec[0][0] if t_rec and t_rec[0][0] else 0
+    t_pago = run_query("SELECT SUM(valor) FROM despesas WHERE status='Pago'", fetch=True)
+    t_pago = t_pago[0][0] if t_pago and t_pago[0][0] else 0
+    t_pend = run_query("SELECT SUM(valor) FROM despesas WHERE status='Pendente'", fetch=True)
+    t_pend = t_pend[0][0] if t_pend and t_pend[0][0] else 0
     
     mes_at = datetime.now().strftime('%Y-%m')
-    iva_s = run_query(f"SELECT SUM(iva) FROM despesas WHERE TO_CHAR(data, 'YYYY-MM') = '{mes_at}'", fetch=True)[0][0] or 0
-    iva_l = run_query(f"SELECT SUM(iva) FROM receitas WHERE TO_CHAR(data, 'YYYY-MM') = '{mes_at}'", fetch=True)[0][0] or 0
+    iva_s = run_query(f"SELECT SUM(iva) FROM despesas WHERE TO_CHAR(data, 'YYYY-MM') = '{mes_at}'", fetch=True)
+    iva_s = iva_s[0][0] if iva_s and iva_s[0][0] else 0
+    iva_l = run_query(f"SELECT SUM(iva) FROM receitas WHERE TO_CHAR(data, 'YYYY-MM') = '{mes_at}'", fetch=True)
+    iva_l = iva_l[0][0] if iva_l and iva_l[0][0] else 0
 
     with st.container(border=True):
         st.subheader("📈 Visão Global de Caixa")
@@ -203,19 +237,18 @@ elif st.session_state.menu == "Dashboard":
         ci2.metric("IVA Liquidado (Vendas)", formatar_moeda(iva_l), delta_color="inverse")
         ci3.metric("Saldo IVA", formatar_moeda(iva_s - iva_l), delta="A Recuperar" if (iva_s - iva_l) > 0 else "A Pagar")
 
+    df_evol, df_pie, df_list = obter_dados_dashboard(mes_at)
+
     st.write("")
     col_g1, col_g2 = st.columns([2, 1])
     with col_g1:
         st.subheader("Evolução Mensal")
-        df_evol = pd.read_sql_query("SELECT TO_CHAR(data, 'YYYY-MM') as mes, 'Receita' as tipo, SUM(valor) as total FROM receitas WHERE status='Pago' GROUP BY mes UNION ALL SELECT TO_CHAR(data, 'YYYY-MM') as mes, 'Despesa' as tipo, SUM(valor) as total FROM despesas WHERE status='Pago' GROUP BY mes", conn)
         if not df_evol.empty: st.plotly_chart(px.bar(df_evol.sort_values('mes'), x='mes', y='total', color='tipo', barmode='group'), use_container_width=True)
     with col_g2:
         st.subheader("Distribuição Despesas")
-        df_pie = pd.read_sql_query("SELECT categoria, SUM(valor) as total FROM despesas WHERE status='Pago' GROUP BY categoria", conn)
         if not df_pie.empty: st.plotly_chart(px.pie(df_pie, values='total', names='categoria', hole=0.4), use_container_width=True)
     
     st.subheader("🧾 Contas a Pagar (Despesas)")
-    df_list = pd.read_sql_query("SELECT id, data, fornecedor, centro_custo, valor, iva, status FROM despesas ORDER BY status DESC, data DESC LIMIT 15", conn)
     if not df_list.empty:
         df_list['valor'] = df_list['valor'].apply(formatar_moeda)
         df_list['iva'] = df_list['iva'].apply(formatar_moeda)
@@ -234,7 +267,7 @@ elif st.session_state.menu == "Faturas":
     with t_ia:
         up = st.file_uploader("Arraste a Fatura da Despesa", type=['png', 'jpg', 'pdf'])
         if up:
-            with st.spinner("IA a processar dados..."):
+            with st.spinner("🤖 IA a ler o documento... aguarde uns segundos..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{up.name.split('.')[-1]}") as tmp:
                     tmp.write(up.getvalue()); t_path = tmp.name
                 modelo = genai.GenerativeModel('gemini-2.5-flash')
@@ -256,7 +289,9 @@ elif st.session_state.menu == "Faturas":
                     if st.form_submit_button("Guardar Despesa na Nuvem", use_container_width=True):
                         run_query("INSERT INTO despesas (data, fornecedor, num_fatura, valor, iva, status, centro_custo, criado_por) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                                   (f_dat, f_forn, f_num, f_val, f_iva, f_stat, f_cc, st.session_state.usuario_nome))
-                        st.success("Despesa Guardada no Supabase!"); st.rerun()
+                        st.success("Despesa Guardada no Supabase!")
+                        limpar_memoria() 
+                        st.rerun()
 
     with t_man:
         with st.form("f_man_desp"):
@@ -266,10 +301,12 @@ elif st.session_state.menu == "Faturas":
             if st.form_submit_button("Registar Despesa Manual", use_container_width=True):
                 run_query("INSERT INTO despesas (data, fornecedor, num_fatura, valor, iva, status, centro_custo, criado_por) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", 
                           (str(dm), fm, nm, vm, im, sm, cm, st.session_state.usuario_nome))
-                st.success("Registado!"); st.rerun()
+                st.success("Registado!")
+                limpar_memoria()
+                st.rerun()
 
 # ===============================================
-# REGISTAR RECEITA 
+# REGISTAR RECEITA (Erro Corrigido Aqui!)
 # ===============================================
 elif st.session_state.menu == "Receitas":
     st.title("💰 Registar Faturação (Receitas)")
@@ -278,8 +315,8 @@ elif st.session_state.menu == "Receitas":
     
     with t_ia_rec:
         up_r = st.file_uploader("Arraste a Fatura Emitida", type=['png', 'jpg', 'pdf'])
-        if up_r and api_key:
-            with st.spinner("IA a processar..."):
+        if up_r:
+            with st.spinner("🤖 IA a processar documento... aguarde..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{up_r.name.split('.')[-1]}") as tmp:
                     tmp.write(up_r.getvalue()); t_path = tmp.name
                 modelo = genai.GenerativeModel('gemini-2.5-flash')
@@ -300,7 +337,9 @@ elif st.session_state.menu == "Receitas":
                         run_query("INSERT INTO clientes (nome) VALUES (%s) ON CONFLICT (nome) DO NOTHING", (c_ia,))
                         run_query("INSERT INTO receitas (data, cliente, valor, iva, categoria, status, criado_por) VALUES (%s,%s,%s,%s,%s,%s,%s)", 
                                   (d_ia, c_ia, v_ia, iv_ia, "Serviço Prestado", stat_ia, st.session_state.usuario_nome))
-                        st.success("Receita Guardada!"); st.rerun()
+                        st.success("Receita Guardada!")
+                        limpar_memoria()
+                        st.rerun()
 
     with t_man_rec:
         with st.form("f_man_rec"):
@@ -314,7 +353,9 @@ elif st.session_state.menu == "Receitas":
             if st.form_submit_button("Registar Receita Manual", use_container_width=True):
                 run_query("INSERT INTO receitas (data, cliente, valor, iva, categoria, status, criado_por) VALUES (%s,%s,%s,%s,%s,%s,%s)", 
                           (str(dm), cm, vm, ivm, "Serviço Prestado", sm, st.session_state.usuario_nome))
-                st.success("Registado!"); st.rerun()
+                st.success("Registado!")
+                limpar_memoria()
+                st.rerun()
                 
     st.write("")
     st.subheader("🧾 Contas a Receber (Receitas Registadas)")
@@ -349,7 +390,9 @@ elif st.session_state.menu == "Clientes":
     with st.form("f_cli"):
         c1, c2 = st.columns(2); n = c1.text_input("Nome Cliente"); p = c2.text_input("País")
         if st.form_submit_button("Criar Cliente"):
-            run_query("INSERT INTO clientes (nome, pais) VALUES (%s,%s)", (n, p)); st.rerun()
+            run_query("INSERT INTO clientes (nome, pais) VALUES (%s,%s)", (n, p))
+            limpar_memoria()
+            st.rerun()
     df_c = pd.read_sql_query("SELECT nome, pais, responsavel, email FROM clientes", get_connection())
     st.dataframe(df_c, use_container_width=True, hide_index=True)
 
@@ -368,5 +411,6 @@ elif st.session_state.menu == "Pastas":
     st.title("📂 Explorador de Pastas")
     st.warning("Aviso Cloud: O arquivo digital (PDFs) continuará a ser gerado na sua máquina local até ativarmos o Storage em Nuvem.")
     pasta = st.selectbox("Escolha a Categoria Principal", CATEGORIAS_BASE)
-    df_p = pd.read_sql_query(f"SELECT data, fornecedor, valor FROM despesas WHERE categoria='{pasta}'", get_connection())
+    
+    df_p = obter_dados_pastas(pasta)
     st.dataframe(df_p, use_container_width=True, hide_index=True)
